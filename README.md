@@ -1,8 +1,8 @@
 # gh-runner-lab
 
-Lab nhỏ, tự chứa: dựng **2 system container Incus**, mỗi container chạy **một
-GitHub Actions self-hosted runner dạng ephemeral** (mỗi job một runner mới).
-Toàn bộ điều khiển bằng một script `lab.sh`.
+Small, self-contained lab: builds **2 Incus system containers**, each running
+**one ephemeral GitHub Actions self-hosted runner** (a fresh runner per job).
+Everything is driven by a single `lab.sh` script.
 
 ```
 host Ubuntu 26.04 + incus 6.0.5
@@ -11,100 +11,104 @@ host Ubuntu 26.04 + incus 6.0.5
     └── gh-runner-2  (4 CPU, 6GiB)  → gh-runner.service → 1 job → restart
 ```
 
-Đưa repo lên GitHub và chạy runner ngay trên máy này (không cần Incus): xem
-[`GITHUB.md`](GITHUB.md) và [`local-runner/README.md`](local-runner/README.md).
+To push the repo to GitHub and run the runner on this machine directly (no Incus
+needed), see [`GITHUB.md`](GITHUB.md) and [`local-runner/README.md`](local-runner/README.md).
 
-## Hai đường provisioning
+## Two provisioning paths
 
-Lab cố ý giữ **hai** đường độc lập, mỗi đường chạy được một mình:
+The lab deliberately keeps **two** independent paths, each of which works on its
+own:
 
 | | Path A — cloud-init | Path B — Ansible |
 |---|---|---|
 | File | `cloud-init/runner.yaml` | `ansible/prepare.yml`, `ansible/runner.yml` |
-| Chạy khi nào | Chỉ lần boot đầu tiên của container | Bất cứ lúc nào, chạy lại bao nhiêu lần cũng được |
-| Tính chất | Khai báo, one-shot, không sửa lại được | Idempotent, tự sửa trạng thái lệch |
-| Lệnh | `./lab.sh create` | `./lab.sh ansible prepare`, `./lab.sh ansible runner` |
-| Hợp với | Đóng gói baseline cho container mới | Lặp lại, sửa lỗi trên container đang chạy |
+| When it runs | Only on the container's first boot | Any time, as often as you like |
+| Nature | Declarative, one-shot, cannot be amended | Idempotent, corrects drift on its own |
+| Command | `./lab.sh create` | `./lab.sh ansible prepare`, `./lab.sh ansible runner` |
+| Best for | Packaging a baseline for new containers | Repetition, fixing a container that is already running |
 
-**Đường nào dạy điều gì.** Path A dạy cách mô tả một máy bằng dữ liệu: toàn bộ
-file là YAML khai báo, không có bước nào, và kết quả chỉ thấy được trên container
-vừa tạo. Path B dạy cách giữ một máy ở trạng thái mong muốn: mỗi task tự kiểm tra
-trước khi làm, nên chạy lần hai không đổi gì, và lỗi giữa đường thì chạy lại là
-xong.
+**What each path teaches.** Path A teaches how to describe a machine as data: the
+whole file is declarative YAML, there are no steps, and you only see the result on
+the container you just created. Path B teaches how to keep a machine in a desired
+state: each task checks before it acts, so a second run changes nothing, and a
+failure partway through is fixed by running again.
 
-cloud-init **chỉ áp dụng ở lần boot đầu**. `incus profile set ... cloud-init.user-data`
-sau đó chỉ ảnh hưởng container được tạo *mới*; container đang chạy không nhận gì
-cả. Đó là lý do các thay đổi cần lặp lại nằm trong `ansible/`.
+cloud-init **applies only on the first boot**. A later
+`incus profile set ... cloud-init.user-data` affects only containers created
+*after* the change; a running container receives nothing. That is why changes
+that need repeating live in `ansible/`.
 
-## Phần mềm trong container
+## Software in the container
 
-| Thành phần | Path A (cloud-init) | Path B (Ansible) |
+| Component | Path A (cloud-init) | Path B (Ansible) |
 |---|---|---|
-| Gói apt nền | `packages:` trong `cloud-init/runner.yaml` | task "Install base packages" trong `ansible/prepare.yml`, cùng danh sách |
-| GitHub CLI | không có | repo apt chính thức + `gh` |
-| uv | không có | `/usr/local/bin/uv` cho mọi user |
-| ruff | không có | `uv tool install ruff` cho `ubuntu`, symlink `/usr/local/bin/ruff` |
-| PostgreSQL | `postgresql`, `libpq-dev` | như trên + role `ubuntu` (idempotent) |
-| Redis | `redis-server` | như trên + unix socket (idempotent) |
-| Runner binaries | không có | `ansible/runner.yml` |
+| Base apt packages | `packages:` in `cloud-init/runner.yaml` | the "Install base packages" task in `ansible/prepare.yml`, same list |
+| GitHub CLI | none | official apt repo + `gh` |
+| uv | none | `/usr/local/bin/uv` for every user |
+| ruff | none | `uv tool install ruff` for `ubuntu`, symlink `/usr/local/bin/ruff` |
+| PostgreSQL | `postgresql`, `libpq-dev` | as above + the `ubuntu` role (idempotent) |
+| Redis | `redis-server` | as above + unix socket (idempotent) |
+| Runner binaries | none | `ansible/runner.yml` |
 
-`gh`, `uv`, `ruff` chỉ có ở Path B (và ở `./lab.sh toolchain`) — cloud-init giữ
-đúng danh sách gói tối thiểu, phần còn lại là việc của đường idempotent.
+`gh`, `uv`, `ruff` exist only on Path B (and in `./lab.sh toolchain`) — cloud-init
+stays with the minimal package list; the rest is the idempotent path's job.
 
-## PostgreSQL và Redis
+## PostgreSQL and Redis
 
-Cả hai chỉ nghe trên loopback (Redis `127.0.0.1:6379`, PostgreSQL
-`127.0.0.1:5432`) và **không** expose ra `eth0`; lab dùng unix socket cho cả hai
-nên không có cổng nào phải mở.
+Both listen on loopback only (Redis `127.0.0.1:6379`, PostgreSQL
+`127.0.0.1:5432`) and are **not** exposed on `eth0`; the lab uses a unix socket
+for both, so there is no port to open.
 
-**Redis** — socket `/run/redis/redis-server.sock`, quyền `766`, khai báo trong
-`/etc/redis/redis.conf` (`unixsocket`, `unixsocketperm`). Ubuntu không có
-`conf.d` include nên cả hai đường đều sửa trực tiếp file này.
+**Redis** — socket `/run/redis/redis-server.sock`, permissions `766`, declared in
+`/etc/redis/redis.conf` (`unixsocket`, `unixsocketperm`). Ubuntu has no `conf.d`
+include, so both paths edit that file directly.
 
 ```bash
 incus exec gh-runner-1 -- redis-cli -s /run/redis/redis-server.sock ping
 ```
 
-**PostgreSQL** — role `ubuntu` (superuser, **không mật khẩu**), xác thực peer
-qua unix socket, nên user nào đăng nhập được vào container thì vào được database
-bằng chính tên đó.
+**PostgreSQL** — the `ubuntu` role (superuser, **no password**) authenticates by
+peer over the unix socket, so any user who can log in to the container reaches
+the database under that same name.
 
 ```bash
 incus exec gh-runner-1 -- psql -c 'select current_user, version()'
 ```
 
-Biến môi trường cho project FastAPI (SQLAlchemy async + asyncpg trỏ vào socket):
+Environment variables for a FastAPI project (SQLAlchemy async + asyncpg pointed
+at the socket):
 
 ```bash
 DATABASE_URL=postgresql+asyncpg:///postgres?host=/var/run/postgresql
 REDIS_URL=unix:///run/redis/redis-server.sock
 ```
 
-## Kiểm tra trước khi chạy
+## Checks before running
 
 ```bash
-incus list                  # phải liệt kê được container
-id -nG | grep incus-admin   # phải thấy incus-admin
+incus list                  # must list containers
+id -nG | grep incus-admin   # must show incus-admin
 ```
 
-Nếu `incus list` báo lỗi quyền: phiên đăng nhập chưa có group. Sửa bằng
-`su - $USER`, `newgrp incus-admin`, hoặc logout/login hẳn.
+If `incus list` reports a permission error, the login session lacks the group.
+Fix it with `su - $USER`, `newgrp incus-admin`, or a full logout/login.
 
-## Thứ tự chạy
+## Run order
 
 ```bash
-sudo ./lab.sh host-prep          # 1 lần duy nhất, cần sudo
+sudo ./lab.sh host-prep          # one time only, needs sudo
 ./lab.sh create                  # profile + containers + cloud-init
-./lab.sh toolchain               # hoặc: ./lab.sh ansible prepare
-./lab.sh runner                  # hoặc: ./lab.sh ansible runner
+./lab.sh toolchain               # or: ./lab.sh ansible prepare
+./lab.sh runner                  # or: ./lab.sh ansible runner
 ./lab.sh register OWNER/REPO <token>
 ```
 
-`toolchain`/`runner` là bản imperative (gọi `incus exec`); `ansible prepare`/
-`ansible runner` làm cùng việc nhưng qua playbook idempotent. Chọn một, hoặc
-chạy cả hai để so sánh — chạy lần lượt cũng không hỏng gì.
+`toolchain`/`runner` are the imperative versions (they call `incus exec`);
+`ansible prepare`/`ansible runner` do the same work through idempotent playbooks.
+Pick one, or run both to compare — running them one after the other breaks
+nothing.
 
-Ansible cần cài trên **host**, không phải trong container:
+Ansible must be installed on the **host**, not in the container:
 
 ```bash
 sudo apt install -y ansible
@@ -113,83 +117,86 @@ ansible-galaxy collection install -r ansible/requirements.yml
 ./lab.sh ansible runner
 ```
 
-`./lab.sh ansible` tự sinh `ansible/inventory.generated.yml` từ các container
-đang có (file này **không** commit, mỗi lần chạy lại ghi đè). Inventory dùng
-`ansible_connection: community.general.incus`; chỉ cần thêm
-`ansible_incus_project` khi user hiện tại **không** thuộc group `incus-admin`.
+`./lab.sh ansible` generates `ansible/inventory.generated.yml` from the existing
+containers (this file is **not** committed, and every run overwrites it). The
+inventory uses `ansible_connection: community.general.incus`; add
+`ansible_incus_project` only when the current user is **not** in the
+`incus-admin` group.
 
-Biến môi trường ghi đè: `RUNNER_COUNT`, `RUNNER_PREFIX`, `PROFILE`, `IMAGE`,
+Environment overrides: `RUNNER_COUNT`, `RUNNER_PREFIX`, `PROFILE`, `IMAGE`,
 `RUNNER_LABELS`, `RUNNER_VERSION`, `RUNNER_CPU`, `RUNNER_MEM`,
 `RUNNER_WORKDIR`, `GH_RUNNER_TOKEN`, `GH_RUNNER_PAT`.
 
-## Các gotcha và cách xử lý
+## Gotchas and how to handle them
 
-| Hiện tượng | Nguyên nhân | Fix |
+| Symptom | Cause | Fix |
 |---|---|---|
-| Lệnh trong container treo, không trả về | Ubuntu 25.04+ giới hạn AppArmor cho unprivileged unconfined profile | `host-prep` ghi `/etc/sysctl.d/50-incus-apparmor.conf` với `kernel.apparmor_restrict_unprivileged_unconfined=0` (nguồn: quan.hoabinh.vn, bài 2025/11 "fix commands hanging in incus container") |
-| systemd trong container không khởi động được unit, hoặc job cần Docker/user namespace | Thiếu nesting | Profile `gh-runner` đặt `security.nesting=true` |
-| Container không resolve được DNS | `systemd-resolved` trên host (127.0.0.53) không phục vụ container | `incusbr0` đã có `raw.dnsmasq "server=1.1.1.1"`; lưu ý setting này tắt AppArmor cho tiến trình dnsmasq của Incus |
-| `/dev/kvm` có trên host nhưng không dùng | Ta chạy system container, không phải VM | Bỏ qua, không cần cấu hình gì |
-| `./lab.sh ansible ...` không kết nối được container | Thiếu group, hoặc collection chưa cài | `id -nG \| grep incus-admin` phải thấy `incus-admin`; kiểm tra `ansible-galaxy collection install -r ansible/requirements.yml` đã chạy xong chưa (`ansible-galaxy collection list \| grep community.general`) |
-| Sửa `cloud-init.user-data` rồi mà container không đổi | cloud-init chỉ chạy lần boot đầu | Tạo lại container (`./lab.sh destroy --yes && ./lab.sh create`), hoặc dùng `./lab.sh ansible prepare` |
+| Commands inside the container hang and never return | Ubuntu 25.04+ restricts AppArmor for unprivileged unconfined profiles | `host-prep` writes `/etc/sysctl.d/50-incus-apparmor.conf` with `kernel.apparmor_restrict_unprivileged_unconfined=0` (source: quan.hoabinh.vn, the 2025/11 post "fix commands hanging in incus container") |
+| systemd in the container cannot start a unit, or a job needs Docker/user namespaces | Nesting is missing | The `gh-runner` profile sets `security.nesting=true` |
+| The container cannot resolve DNS | `systemd-resolved` on the host (127.0.0.53) does not serve containers | `incusbr0` already sets `raw.dnsmasq "server=1.1.1.1"`; note that this setting disables AppArmor for Incus's dnsmasq process |
+| `/dev/kvm` exists on the host but goes unused | We run system containers, not VMs | Ignore it, no configuration needed |
+| `./lab.sh ansible ...` cannot reach the container | The group is missing, or the collection is not installed | `id -nG \| grep incus-admin` must show `incus-admin`; check that `ansible-galaxy collection install -r ansible/requirements.yml` has finished (`ansible-galaxy collection list \| grep community.general`) |
+| You edit `cloud-init.user-data` and the container does not change | cloud-init runs only on the first boot | Recreate the container (`./lab.sh destroy --yes && ./lab.sh create`), or use `./lab.sh ansible prepare` |
 
-## Lấy registration token
+## Getting a registration token
 
-Cách 1 — giao diện web: repo → **Settings → Actions → Runners → New self-hosted
-runner**, copy giá trị sau `--token`.
+Option 1 — web UI: repo → **Settings → Actions → Runners → New self-hosted
+runner**, copy the value after `--token`.
 
-Cách 2 — CLI:
+Option 2 — CLI:
 
 ```bash
 gh api -X POST /repos/OWNER/REPO/actions/runners/registration-token -q .token
 ```
 
-Token hết hạn sau khoảng 1 giờ, nên lấy ngay trước khi `register`.
+The token expires after about 1 hour, so fetch it right before `register`.
 
-## Ephemeral: đọc trước khi dùng
+## Ephemeral: read this before using it
 
-`config.sh` được gọi với `--ephemeral`: runner **tự hủy đăng ký sau đúng một
-job**, nên mỗi lần chạy lại cần token đăng ký mới. Vì vậy `lab.sh register`
-cài thêm `/opt/actions-runner/run-ephemeral.sh` và một unit systemd
-`Restart=always`: wrapper lấy token mới từ GitHub API rồi mới `./run.sh`.
+`config.sh` is called with `--ephemeral`: the runner **unregisters itself after
+exactly one job**, so every restart needs a new registration token. That is why
+`lab.sh register` also installs `/opt/actions-runner/run-ephemeral.sh` and a
+systemd unit with `Restart=always`: the wrapper fetches a new token from the
+GitHub API and only then runs `./run.sh`.
 
-Wrapper chỉ lấy được token mới khi có PAT ở `/etc/gh-runner/token`
-(xuất `GH_RUNNER_PAT` trước khi chạy `register`). Không có PAT thì chỉ job đầu
-tiên chạy được.
+The wrapper can fetch a new token only when a PAT is present at
+`/etc/gh-runner/token` (export `GH_RUNNER_PAT` before running `register`).
+Without a PAT, only the first job runs.
 
-Muốn quay về runner **persistent** (đăng ký một lần, chạy mãi):
+To go back to a **persistent** runner (register once, run forever):
 
-1. Bỏ `--ephemeral` trong lệnh `config.sh` (cả trong `lab.sh register` và
-   trong `run-ephemeral.sh`).
-2. Cho unit chạy thẳng `./run.sh` thay vì wrapper, hoặc để wrapper gọi
-   `./run.sh` mà không đăng ký lại.
+1. Drop `--ephemeral` from the `config.sh` call (both in `lab.sh register` and in
+   `run-ephemeral.sh`).
+2. Have the unit run `./run.sh` directly instead of the wrapper, or let the
+   wrapper call `./run.sh` without re-registering.
 
 ## Troubleshooting
 
 ```bash
 incus list
-incus exec gh-runner-1 -- ping -c1 10.156.39.1     # kiểm tra ra gateway
+incus exec gh-runner-1 -- ping -c1 10.156.39.1     # check outbound to the gateway
 incus exec gh-runner-1 -- journalctl -u gh-runner -f
 ./lab.sh status
-./lab.sh logs                # 50 dòng cuối của gh-runner trên gh-runner-1
+./lab.sh logs                # last 50 lines of gh-runner on gh-runner-1
 ./lab.sh logs gh-runner-2
-incus exec gh-runner-1 -- gh-runner-info           # tên + IP container
+incus exec gh-runner-1 -- gh-runner-info           # container name + IP
 ```
 
-Job không được nhận: kiểm tra `RUNNER_LABELS` có khớp `runs-on` trong workflow
-không (mặc định `self-hosted,linux,x64,incus`).
+Job never picked up: check that `RUNNER_LABELS` matches `runs-on` in the workflow
+(default `self-hosted,linux,x64,incus`).
 
-## Dùng lại cho repo khác — `template/`
+## Reusing for another repo — `template/`
 
-Lab này là bản tham chiếu một project. `template/` là bản **copy-and-adapt**: copy
-nguyên thư mục sang repo của bạn, sửa đúng một file YAML, chạy vài lệnh. Tài liệu
-trong đó viết tiếng Anh để đưa được cho người khác.
+This lab is a reference implementation for one project. `template/` is the
+**copy-and-adapt** version: copy the whole directory into your repo, edit exactly
+one YAML file, run a few commands. Its docs are written in English so you can
+hand them to someone else.
 
 ```
 template/
-├── requirements/<repo>.yml   # file duy nhất bạn sửa: gói apt, repo apt, uv, node, service, sysctl, env
+├── requirements/<repo>.yml   # the only file you edit: apt packages, apt repos, uv, node, service, sysctl, env
 ├── scripts/render.py         # YAML → cloud-init/user-data.yaml + ansible/vars/generated.yml
-├── schema/                   # JSON Schema để editor validate
+├── schema/                   # JSON Schema for editor validation
 ├── ansible/                  # prepare.yml (idempotent) + runner.yml
 ├── tests/                    # 36 contract test, stdlib unittest
 └── setup.sh                  # render / create / prepare / runner / register / status / destroy
@@ -201,25 +208,26 @@ cd template
 ./setup.sh create && ./setup.sh prepare && ./setup.sh runner
 ```
 
-Khác biệt có chủ đích so với `lab.sh`:
+Deliberate differences from `lab.sh`:
 
-| | `lab.sh` (lab này) | `template/setup.sh` |
+| | `lab.sh` (this lab) | `template/setup.sh` |
 |---|---|---|
-| Tên, image, user, gói | hardcode trong script | sinh từ `requirements/*.yml` |
-| Profile Incus | `gh-runner` | `<name>` + marker `user.kit` (từ chối sửa profile lạ, kể cả `default`) |
-| Container lạ cùng tên | không kiểm tra | từ chối, chỉ nhận container gắn đúng profile |
-| PAT cho ephemeral | `export GH_TOKEN` | chỉ dùng cho một lệnh `gh api`, có fallback khi lỗi |
+| Names, image, user, packages | hardcoded in the script | generated from `requirements/*.yml` |
+| Incus profile | `gh-runner` | `<name>` + the `user.kit` marker (refuses to modify a foreign profile, including `default`) |
+| Foreign container with the same name | not checked | refused; only containers carrying the right profile are accepted |
+| PAT for ephemeral | `export GH_TOKEN` | used only for a single `gh api` call, with a fallback on error |
 
-Ba điểm cần đọc trước khi dùng PAT: job chạy cùng user với runner nên **đọc được**
-`/etc/gh-runner/token`; chỉ đăng ký repo có workflow tin cậy; dùng fine-grained PAT
-giới hạn `Administration: write`. Chi tiết trong `template/README.md`.
+Three things to read before using a PAT: jobs run as the same user as the runner,
+so they **can read** `/etc/gh-runner/token`; register only repos with trusted
+workflows; use a fine-grained PAT limited to `Administration: write`. Details in
+`template/README.md`.
 
-Terraform không phải đường thứ ba — lý do và skeleton nằm ở
+Terraform is not a third path — the reasoning and a skeleton live in
 `template/terraform/README.md` (docs-only).
 
-## Dọn dẹp
+## Cleanup
 
 ```bash
-./lab.sh destroy          # hỏi xác nhận
-./lab.sh destroy --yes    # xóa container + profile, không hỏi
+./lab.sh destroy          # asks for confirmation
+./lab.sh destroy --yes    # delete containers + profile, no prompt
 ```
