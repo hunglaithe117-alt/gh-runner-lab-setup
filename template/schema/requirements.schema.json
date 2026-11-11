@@ -1,0 +1,303 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/gh-runner-lab/requirements.schema.json",
+  "title": "Runner requirements profile",
+  "description": "One project's package requirements, consumed by scripts/render.py to emit cloud-init/user-data.yaml and ansible/vars/generated.yml. Unknown keys are a hard error: a typo in a copied profile must fail loudly instead of being silently ignored. Top-level keys starting with x- are ignored anchor containers: they exist only to hold `&anchor` values for `<<:` merges in the same file and are otherwise ignored.",
+  "type": "object",
+  "additionalProperties": false,
+  "patternProperties": {
+    "^x-": {
+      "description": "Ignored anchor container, e.g. `x-base: &base {...}` merged later with `<<: *base`. Never rendered."
+    }
+  },
+  "required": [
+    "name"
+  ],
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z0-9]([a-z0-9-]{0,58}[a-z0-9])?$",
+      "description": "Profile name. Becomes the sysctl drop-in filename (/etc/sysctl.d/60-<name>.conf), the gen_name variable, the Incus profile name and the default container prefix, so it is restricted to lowercase letters, digits and hyphens, must not end in a hyphen, and is at most 60 characters. The cap leaves room for the -1/-2 suffix setup.sh appends, which must stay inside Incus's 63-character instance-name limit."
+    },
+    "description": {
+      "type": "string",
+      "description": "Free-form note about what this profile installs. Rendered nowhere; read by humans.",
+      "default": ""
+    },
+    "image": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Incus image the container is created from.",
+      "default": "images:ubuntu/26.04/cloud"
+    },
+    "runner_user": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32,
+      "pattern": "^[a-z_][a-z0-9_-]*$",
+      "description": "Unprivileged user that owns the runner and the work directory. It must be an account that already exists in the chosen image: the kit creates no users. `setup.sh create` and the first task of prepare.yml fail fast when the account is missing; cloud-init only notices it when the profile has an `env` block, whose group lookup needs the account. It must also equal the PostgreSQL role name, because peer auth compares the OS user to the role. root and postgres are rejected outright.",
+      "default": "ubuntu",
+      "not": {
+        "enum": [
+          "root",
+          "postgres"
+        ]
+      }
+    },
+    "timezone": {
+      "type": "string",
+      "description": "IANA timezone passed to cloud-init as timezone:. Empty means leave the image default.",
+      "default": ""
+    },
+    "locale": {
+      "type": "string",
+      "pattern": "^(?:[A-Za-z]{2,3}_[A-Za-z]{2}(?:\\.[A-Za-z0-9-]+)?)?$",
+      "description": "Locale generated at first boot (locale-gen <locale>), e.g. en_US.UTF-8. Empty means leave the image default. Must match the locale pattern because the value is interpolated into a shell command.",
+      "default": ""
+    },
+    "apt": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "APT baseline. Packages are installed by both paths; extra repositories are Ansible-only because cloud-init cannot add signed sources reliably. An explicit null is rejected as ambiguous; omit the block or write {}.",
+      "properties": {
+        "update": {
+          "type": "boolean",
+          "description": "Maps to cloud-init package_update:. Set false only when the image cache is known fresh.",
+          "default": true
+        },
+        "packages": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^-]",
+            "description": "Package name. Leading and trailing whitespace is trimmed and a leading '-' is rejected."
+          },
+          "uniqueItems": true,
+          "description": "Package names installed as-is. No version pins, no wildcards: the profile is a requirement list, not a lockfile. Duplicates collapse to their first occurrence. Packages the enabled services need (postgresql, redis-server) and the locale/timezone tooling (locales, tzdata) are added to the cloud-init package list by the renderer and need not be listed here.",
+          "default": []
+        },
+        "repositories": {
+          "type": "array",
+          "description": "Extra signed APT repositories. Ansible-path only.",
+          "default": [],
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "uri",
+              "suite",
+              "components"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z0-9]([a-z0-9-]{0,58}[a-z0-9])?$",
+                "description": "deb822 repository name; also the keyring filename stem. Same pattern as the profile name because it becomes a filename."
+              },
+              "uri": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Repository base URI, e.g. https://cli.github.com/packages."
+              },
+              "suite": {
+                "type": "string",
+                "minLength": 1,
+                "description": "deb822 Suites: value, e.g. stable."
+              },
+              "components": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "minItems": 1,
+                "description": "deb822 Components: values, e.g. [main]."
+              },
+              "key_url": {
+                "type": "string",
+                "description": "URL of the armored signing key. Empty means the repository is unsigned (rare; only for local mirrors).",
+                "default": ""
+              },
+              "packages": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[^-]"
+                },
+                "uniqueItems": true,
+                "description": "Packages installed once this repository is registered.",
+                "default": []
+              }
+            }
+          }
+        }
+      }
+    },
+    "python": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Python tooling. Installs uv, then `uv tool install <name>` as runner_user. Ansible-path only. An explicit null is rejected as ambiguous; omit the block or write {}.",
+      "properties": {
+        "uv_tools": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^-]",
+            "description": "Tool name. Whitespace is trimmed and a leading '-' is rejected."
+          },
+          "uniqueItems": true,
+          "description": "Tool names resolvable from PyPI, e.g. [ruff, mypy]. Duplicates collapse.",
+          "default": []
+        }
+      }
+    },
+    "node": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Node.js tooling installed from NodeSource. Ansible-path only. An explicit null is rejected as ambiguous; omit the block or write {}.",
+      "properties": {
+        "major": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Node.js major version, e.g. 24. Required whenever npm_globals is non-empty; absent otherwise means Node is not installed at all."
+        },
+        "npm_globals": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^-]"
+          },
+          "uniqueItems": true,
+          "description": "Packages installed with `npm install --global`. A non-empty list without node.major is an error: there is no npm to run. Duplicates collapse.",
+          "default": []
+        }
+      },
+      "dependentSchemas": {
+        "npm_globals": {
+          "if": {
+            "properties": {
+              "npm_globals": {
+                "minItems": 1
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "major"
+            ]
+          }
+        }
+      }
+    },
+    "services": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Services configured on the container. Presence of a block enables it: `postgres: {}` means enabled, and `enabled: false` switches it off. An explicit null is rejected as ambiguous.",
+      "properties": {
+        "postgres": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "PostgreSQL with peer auth over the unix socket: no password is stored anywhere. A present block enables it unless enabled is false.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Provision the server and the peer-auth role. Defaults to true because the block exists.",
+              "default": true
+            },
+            "role": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^[a-z_][a-z0-9_-]*$",
+              "description": "Superuser login role created for runner_user, e.g. ubuntu. Defaults to runner_user, and the renderer rejects any other value because peer auth compares the OS user to the role."
+            }
+          }
+        },
+        "redis": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Redis listening on a unix socket instead of TCP. A present block enables it unless enabled is false.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Rewrite the socket directives in /etc/redis/redis.conf and restart the server. Defaults to true because the block exists.",
+              "default": true
+            },
+            "unixsocket": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": "^/[A-Za-z0-9._/-]+$",
+              "description": "Absolute socket path, e.g. /run/redis/redis-server.sock. The renderer splices this value into a sed expression, so only [A-Za-z0-9._/-] after the leading slash is accepted; quotes, backslashes, '&', spaces and '|' are rejected.",
+              "default": "/run/redis/redis-server.sock"
+            },
+            "unixsocketperm": {
+              "type": "string",
+              "pattern": "^[0-7]{3,4}$",
+              "description": "Octal socket permissions as a quoted string, e.g. \"766\". A bare integer is rejected: YAML reads 0766 as an integer and loses the octal meaning.",
+              "default": "766"
+            }
+          }
+        }
+      }
+    },
+    "sysctl": {
+      "type": "object",
+      "description": "Kernel tunables written to /etc/sysctl.d/60-<name>.conf as `key = value` lines and applied with sysctl --system. Flat map; values are strings or integers only, because a boolean is ambiguous (1 and 0 are not the only accepted spellings). An explicit null is rejected as ambiguous; omit the block or write {}.",
+      "propertyNames": {
+        "pattern": "^[A-Za-z0-9_.-]+$"
+      },
+      "additionalProperties": {
+        "type": [
+          "string",
+          "integer"
+        ],
+        "pattern": "^[^\\x00-\\x1f\\x7f]*$"
+      },
+      "default": {}
+    },
+    "env": {
+      "type": "object",
+      "description": "Environment variables written to /etc/runner-env.sh as `KEY=\"value\"` lines, which both systemd's EnvironmentFile parser and a `set -a; .` shell consumer read back identically. Flat map, values stringified. Not a secret store: the file is readable by the runner's group and is baked into the image. The runner wrapper owns GH_* (it sets GH_TOKEN, GH_URL and the registration API path), the dynamic loader reads LD_*, and the names bash itself reads (PATH, HOME, SHELL, IFS, BASH_ENV, LD_PRELOAD, LD_LIBRARY_PATH, ENV, PYTHONPATH) change how jobs resolve commands, so those keys are rejected. An explicit null is rejected as ambiguous; omit the block or write {}.",
+      "propertyNames": {
+        "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+        "not": {
+          "anyOf": [
+            {
+              "pattern": "^GH_"
+            },
+            {
+              "pattern": "^LD_"
+            },
+            {
+              "enum": [
+                "PATH",
+                "HOME",
+                "SHELL",
+                "IFS",
+                "BASH_ENV",
+                "LD_PRELOAD",
+                "LD_LIBRARY_PATH",
+                "ENV",
+                "PYTHONPATH"
+              ]
+            }
+          ]
+        }
+      },
+      "additionalProperties": {
+        "type": [
+          "string",
+          "integer",
+          "number",
+          "boolean"
+        ],
+        "pattern": "^[^\\x00-\\x1f\\x7f]*$"
+      },
+      "default": {}
+    }
+  }
+}

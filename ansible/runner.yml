@@ -1,0 +1,93 @@
+---
+# Installs the GitHub Actions runner binaries only. Registration stays in
+# ./lab.sh register because it needs a short-lived token.
+- name: Install the GitHub Actions runner
+  hosts: all
+  become: true
+  gather_facts: true
+  gather_subset: ["!all"]
+
+  vars:
+    # Empty means "resolve the latest release"; set it to pin a version.
+    lab_runner_version: ""
+    lab_runner_dir: /opt/actions-runner
+    lab_runner_archive: /tmp/actions-runner.tar.gz
+
+  tasks:
+    # The REST API allows 60 unauthenticated calls per hour per egress IP, and
+    # containers share that budget. The release redirect exposes the same tag
+    # through the Location header, which is not rate limited.
+    - name: Resolve the latest runner version from the release redirect
+      ansible.builtin.uri:
+        url: https://github.com/actions/runner/releases/latest
+        method: HEAD
+        follow_redirects: none
+        status_code: [301, 302, 303, 307, 308]
+      register: lab_runner_redirect
+      changed_when: false
+      when: lab_runner_version | length == 0
+
+    - name: Record the runner version
+      ansible.builtin.set_fact:
+        lab_runner_version: >-
+          {{ (lab_runner_redirect.location | default('', true)).split('/') | last
+             | regex_replace('^v', '') }}
+      when: lab_runner_version | length == 0
+
+    - name: Fail when the runner version cannot be resolved
+      ansible.builtin.fail:
+        msg: >-
+          Could not resolve the latest actions/runner version from
+          https://github.com/actions/runner/releases/latest. Pass
+          -e lab_runner_version=<x.y.z> instead.
+      when: lab_runner_version | length == 0
+
+    - name: Create the runner directory
+      ansible.builtin.file:
+        path: "{{ lab_runner_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Check for an existing runner
+      ansible.builtin.stat:
+        path: "{{ lab_runner_dir }}/bin/Runner.Listener"
+      register: lab_runner_listener
+
+    - name: Download the runner archive
+      ansible.builtin.get_url:
+        url: >-
+          https://github.com/actions/runner/releases/download/v{{ lab_runner_version
+          }}/actions-runner-linux-x64-{{ lab_runner_version }}.tar.gz
+        dest: "{{ lab_runner_archive }}"
+        mode: "0644"
+      when: not lab_runner_listener.stat.exists
+
+    - name: Unpack the runner
+      ansible.builtin.unarchive:
+        src: "{{ lab_runner_archive }}"
+        dest: "{{ lab_runner_dir }}"
+        remote_src: true
+        creates: "{{ lab_runner_dir }}/bin/Runner.Listener"
+
+    # installdependencies.sh is not idempotent, so its success is recorded in
+    # a marker file next to the binaries.
+    - name: Install the runner dependencies
+      ansible.builtin.shell:
+        cmd: ./bin/installdependencies.sh && touch .dependencies-installed
+        chdir: "{{ lab_runner_dir }}"
+        creates: "{{ lab_runner_dir }}/.dependencies-installed"
+
+    # Runner.Listener --version exits non-zero on some builds, and the version
+    # is what this task is after.
+    - name: Read the runner version
+      ansible.builtin.command:
+        cmd: "{{ lab_runner_dir }}/bin/Runner.Listener --version"
+      register: lab_runner_binary
+      changed_when: false
+      failed_when: false
+
+    - name: Show the runner version
+      ansible.builtin.debug:
+        msg: "actions-runner {{ lab_runner_version }}: {{ lab_runner_binary.stdout }}"

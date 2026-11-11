@@ -1,0 +1,428 @@
+---
+# Idempotent convergence for the runner containers. Every package, repository,
+# service and file below comes from the rendered profile in
+# vars/generated.yml, so this play carries no project-specific value. Safe to
+# re-run: installers are guarded by `creates:`, stateful steps are probed first.
+- name: Prepare the runner containers
+  hosts: all
+  become: true
+  gather_facts: true
+  # No task reads a fact. Each fact round trip is a process spawn over the Incus
+  # connection, so skipping the collection is measurable on a 2-container lab.
+  gather_subset: ["!all"]
+
+  # Loaded at play time rather than by an include_vars task: the first task
+  # below has to fail on a missing runner_user before anything else runs.
+  vars_files:
+    - vars/generated.yml
+
+  vars:
+    # gen_apt_packages is what the profile lists; gen_service_packages is what
+    # render.py added for the enabled services.
+    kit_apt_packages: "{{ (gen_apt_packages + gen_service_packages) | unique }}"
+    kit_keyring_dir: /etc/apt/keyrings
+    kit_env_file: /etc/runner-env.sh
+    # The separator of the sysctl drop-in, declared here because a Jinja string
+    # literal cannot spell a newline unambiguously.
+    kit_newline: "\n"
+    # Env values are written as KEY="value", escaping only the four characters
+    # both consumers agree on: backslash, double quote, dollar sign, backtick.
+    # The pairs live in YAML because a backslash inside a Jinja string literal
+    # is not portable: ansible-core 2.20 keeps "\\" as two characters where
+    # stock Jinja collapses it to one. Order matters; backslash goes first.
+    kit_env_backslash: '\'
+    kit_env_backslash_escaped: '\\'
+    kit_env_quote: '"'
+    kit_env_quote_escaped: '\"'
+    kit_env_dollar: '$'
+    kit_env_dollar_escaped: '\$'
+    kit_env_tick: '`'
+    kit_env_tick_escaped: '\`'
+
+  tasks:
+    # The kit never creates accounts: an image without the profile's user has
+    # no home directory, no group and no peer-auth role, so every later task
+    # would fail with a message that does not name the field.
+    - name: Read the runner user's account entry
+      ansible.builtin.command:
+        cmd: "getent passwd {{ gen_runner_user }}"
+      register: kit_runner_account
+      changed_when: false
+      failed_when: false
+
+    - name: Require the runner user to exist in the image
+      ansible.builtin.fail:
+        msg: "runner_user '{{ gen_runner_user }}' does not exist in the image"
+      when: kit_runner_account.rc != 0
+
+    # Everything that needs a home directory (uv's tool dir, HOME for
+    # config.sh) reads it from the account instead of assuming /home/<user>.
+    - name: Record the runner user's home directory
+      ansible.builtin.set_fact:
+        kit_runner_home: "{{ kit_runner_account.stdout.split(':')[5] }}"
+
+    # Checked here because the failure it prevents is a mysterious job-time one:
+    # a job step that elevates dies after the runner has taken the job.
+    - name: Check that the runner user can elevate without a password
+      ansible.builtin.command:
+        cmd: sudo -n true
+      become: true
+      become_user: "{{ gen_runner_user }}"
+      register: kit_sudo_check
+      changed_when: false
+      failed_when: false
+
+    - name: Require passwordless sudo for the runner user
+      ansible.builtin.fail:
+        msg: >-
+          runner_user '{{ gen_runner_user }}' cannot run `sudo -n true` in this
+          container, so any job step that elevates will fail. Next: install
+          sudo and grant {{ gen_runner_user }} ALL=(ALL) NOPASSWD:ALL in
+          /etc/sudoers.d/, or stop elevating in the job.
+      when: kit_sudo_check.rc != 0
+
+    # The apt package cache is not desired state: a refresh must never count as
+    # a change, or every `prepare` reports drift on an unchanged container. It is
+    # refreshed once here, gated by the profile's apt.update switch, and no
+    # install task below passes update_cache, which would re-report the refresh.
+    - name: Refresh the apt cache
+      ansible.builtin.apt:
+        update_cache: true
+      changed_when: false
+      when: gen_apt_update
+
+    # get_url, the deb822 key download and the uv/node installers all need
+    # these two, and a minimal image ships neither.
+    - name: Install the download prerequisites
+      ansible.builtin.apt:
+        name:
+          - ca-certificates
+          - curl
+        state: present
+
+    - name: Install the profile's apt packages
+      ansible.builtin.apt:
+        name: "{{ kit_apt_packages }}"
+        state: present
+      when: kit_apt_packages | length > 0
+
+    # The deb822_repository module imports the `debian` Python library on the
+    # target, and python3-debian is not part of a minimal image. It must land
+    # before the first repository task, and is pointless when the profile adds
+    # no repository at all.
+    - name: Install python3-debian for the deb822 repository module
+      ansible.builtin.apt:
+        name: python3-debian
+        state: present
+      when: gen_apt_repositories | length > 0
+
+    - name: Create the apt keyring directory
+      ansible.builtin.file:
+        path: "{{ kit_keyring_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: gen_apt_repositories | length > 0
+
+    # An empty key_url means a repository the profile trusts without a key
+    # (a local mirror behind the same network, typically), so there is nothing
+    # to download and nothing to point signed_by at.
+    - name: Download the signing key of each extra repository
+      ansible.builtin.get_url:
+        url: "{{ item.key_url }}"
+        dest: "{{ kit_key_path }}"
+        owner: root
+        group: root
+        mode: "0644"
+      vars:
+        # APT only treats a key as ascii-armored when the file ends in .asc;
+        # a .asc payload stored as .gpg fails signature verification.
+        kit_key_path: >-
+          {{ kit_keyring_dir }}/{{ item.name }}{{ '.asc' if item.key_url.endswith('.asc') else '.gpg' }}
+      loop: "{{ gen_apt_repositories }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.key_url | length > 0
+
+    # No architectures: the kit runs on amd64 and arm64 containers alike, and a
+    # fixed list would silently make the repository unavailable on the other.
+    - name: Add the extra apt repositories
+      ansible.builtin.deb822_repository:
+        name: "{{ item.name }}"
+        types: [deb]
+        uris: "{{ item.uri }}"
+        suites: ["{{ item.suite }}"]
+        components: "{{ item.components }}"
+        signed_by: "{{ kit_key_path if item.key_url | length > 0 else omit }}"
+        enabled: true
+      vars:
+        kit_key_path: >-
+          {{ kit_keyring_dir }}/{{ item.name }}{{ '.asc' if item.key_url.endswith('.asc') else '.gpg' }}
+      loop: "{{ gen_apt_repositories }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    # A second refresh, because a repository added above must be visible to the
+    # index before its packages can be installed. Same rule as the first: the
+    # cache is state, not a result, so this never reports a change.
+    - name: Refresh the apt cache after adding the extra repositories
+      ansible.builtin.apt:
+        update_cache: true
+      changed_when: false
+      when:
+        - gen_apt_update
+        - gen_apt_repositories | length > 0
+
+    - name: Install the packages each extra repository provides
+      ansible.builtin.apt:
+        name: "{{ item.packages }}"
+        state: present
+      loop: "{{ gen_apt_repositories }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: item.packages | length > 0
+
+    - name: Fetch the uv installer
+      ansible.builtin.get_url:
+        url: https://astral.sh/uv/install.sh
+        dest: /usr/local/lib/uv-install.sh
+        owner: root
+        group: root
+        mode: "0755"
+      when: gen_uv_tools | length > 0
+
+    - name: Install uv into /usr/local/bin
+      ansible.builtin.command:
+        cmd: /usr/local/lib/uv-install.sh
+        creates: /usr/local/bin/uv
+      environment:
+        UV_INSTALL_DIR: /usr/local/bin
+      when: gen_uv_tools | length > 0
+
+    # uv resolves the tool directory from $HOME, and the Incus connection does
+    # not build a login session for become_user, so HOME is set explicitly.
+    - name: Install the profile's uv tools as the runner user
+      ansible.builtin.command:
+        cmd: "/usr/local/bin/uv tool install {{ item }}"
+        creates: "{{ kit_runner_home }}/.local/bin/{{ item }}"
+      become: true
+      become_user: "{{ gen_runner_user }}"
+      environment:
+        HOME: "{{ kit_runner_home }}"
+      loop: "{{ gen_uv_tools }}"
+
+    - name: Check for the installed uv tool binaries
+      ansible.builtin.stat:
+        path: "{{ kit_runner_home }}/.local/bin/{{ item }}"
+      register: kit_uv_tool_binaries
+      loop: "{{ gen_uv_tools }}"
+
+    - name: Link the uv tools into /usr/local/bin
+      ansible.builtin.file:
+        src: "{{ item.stat.path }}"
+        dest: "/usr/local/bin/{{ item.item }}"
+        state: link
+        force: true
+      loop: "{{ kit_uv_tool_binaries.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.stat.exists | default(false)
+
+    # NodeSource ships a per-major setup script rather than a stable repository
+    # definition, and which file it writes (nodesource.list or the deb822
+    # nodesource.sources) depends on the script version. A marker file of our
+    # own is the only stable `creates:` target.
+    - name: Fetch the NodeSource setup script
+      ansible.builtin.get_url:
+        url: "https://deb.nodesource.com/setup_{{ gen_node_major }}.x"
+        dest: "/usr/local/lib/nodesource-setup-{{ gen_node_major }}.sh"
+        owner: root
+        group: root
+        mode: "0755"
+      when: gen_node_enabled
+
+    - name: Add the NodeSource repository
+      ansible.builtin.shell:
+        cmd: >-
+          /usr/local/lib/nodesource-setup-{{ gen_node_major }}.sh
+          && touch /usr/local/lib/.nodesource-{{ gen_node_major }}-installed
+        creates: "/usr/local/lib/.nodesource-{{ gen_node_major }}-installed"
+      when: gen_node_enabled
+
+    - name: Install Node.js
+      ansible.builtin.apt:
+        name: nodejs
+        state: present
+      when: gen_node_enabled
+
+    - name: Install the profile's global npm packages
+      community.general.npm:
+        name: "{{ item }}"
+        global: true
+        state: present
+      loop: "{{ gen_npm_globals }}"
+      when: gen_node_enabled
+
+    # A profile may point the socket at /tmp or /run, so only a missing directory
+    # is created: an existing one already has an owner and a mode that this kit
+    # did not choose and must not rewrite.
+    - name: Check for the Redis runtime directory
+      ansible.builtin.stat:
+        path: "{{ gen_redis_unixsocket | dirname }}"
+      register: kit_redis_dir
+      when: gen_redis_enabled
+
+    # 2755 mirrors RuntimeDirectoryMode= in the shipped unit, so a directory the
+    # unit created later is not reported as drift here.
+    - name: Create the Redis runtime directory
+      ansible.builtin.file:
+        path: "{{ gen_redis_unixsocket | dirname }}"
+        state: directory
+        owner: redis
+        group: redis
+        mode: "2755"
+      when:
+        - gen_redis_enabled
+        - not (kit_redis_dir.stat.exists | default(true))
+
+    - name: Point Redis at the profile's unix socket
+      ansible.builtin.lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: '^#?\s*unixsocket\s+'
+        line: "unixsocket {{ gen_redis_unixsocket }}"
+      notify: Restart redis-server
+      when: gen_redis_enabled
+
+    - name: Set the Redis unix socket permissions
+      ansible.builtin.lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: '^#?\s*unixsocketperm\s+'
+        line: "unixsocketperm {{ gen_redis_unixsocketperm }}"
+      notify: Restart redis-server
+      when: gen_redis_enabled
+
+    - name: Ensure PostgreSQL is running
+      ansible.builtin.systemd_service:
+        name: postgresql
+        state: started
+      when: gen_postgres_enabled
+
+    # runuser rather than become_user: postgres: the module path of the
+    # community.postgresql collection needs the postgres login environment,
+    # which the Incus connection does not reproduce (SETUP.md §6.3).
+    - name: Check for the runner's PostgreSQL role
+      ansible.builtin.command:
+        cmd: >-
+          runuser -u postgres -- psql -tAc
+          "SELECT 1 FROM pg_roles WHERE rolname='{{ gen_postgres_role }}'"
+      register: kit_pg_role
+      changed_when: false
+      when: gen_postgres_enabled
+
+    # shell, not command: the double quotes around the role name are part of
+    # the SQL and `command` would shlex them away, breaking any role whose name
+    # is not a valid unquoted identifier.
+    - name: Create the runner's PostgreSQL superuser role
+      ansible.builtin.shell: # noqa: command-instead-of-shell
+        cmd: >-
+          runuser -u postgres -- psql -c
+          'CREATE ROLE "{{ gen_postgres_role }}" SUPERUSER LOGIN'
+      when:
+        - gen_postgres_enabled
+        - kit_pg_role.stdout | trim != '1'
+
+    # Profile order, not a sort: cloud-init writes this file in profile order,
+    # so a sorted rewrite would report a change against a profile that did not
+    # change.
+    - name: Write the profile's sysctl drop-in
+      ansible.builtin.copy:
+        dest: "/etc/sysctl.d/60-{{ gen_name }}.conf"
+        content: "{{ gen_sysctl.items() | map('join', ' = ') | join(kit_newline) }}\n"
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Reload the kernel parameters
+      when: gen_sysctl | length > 0
+
+    # An emptied sysctl block must not leave the previous run's kernel settings
+    # in place on a container that already exists.
+    - name: Remove the sysctl drop-in when the profile sets none
+      ansible.builtin.file:
+        path: "/etc/sysctl.d/60-{{ gen_name }}.conf"
+        state: absent
+      notify: Reload the kernel parameters
+      when: gen_sysctl | length == 0
+
+    # Both packages are in the cloud-init package list as well; installing them
+    # here is what makes a container that predates that change converge.
+    - name: Install the timezone database
+      ansible.builtin.apt:
+        name: tzdata
+        state: present
+      when: gen_timezone | length > 0
+
+    - name: Install the locale database
+      ansible.builtin.apt:
+        name: locales
+        state: present
+      when: gen_locale | length > 0
+
+    - name: Set the timezone
+      ansible.builtin.timezone:
+        name: "{{ gen_timezone }}"
+      when: gen_timezone | length > 0
+
+    - name: Generate the locale
+      community.general.locale_gen:
+        name: "{{ gen_locale }}"
+        state: present
+      when: gen_locale | length > 0
+
+    # The group is looked up instead of assumed: images routinely name the
+    # primary group differently from the user.
+    - name: Read the runner user's primary group
+      ansible.builtin.command:
+        cmd: "id -gn {{ gen_runner_user }}"
+      register: kit_runner_group
+      changed_when: false
+      when: gen_env | length > 0
+
+    # Byte-identical to what render.py writes: no `export ` prefix, and the
+    # same four-character escaping, so systemd and a shell read back the same
+    # values.
+    - name: Write the runner environment file
+      ansible.builtin.copy:
+        dest: "{{ kit_env_file }}"
+        content: |
+          # Read by the runner's systemd unit. Not a secret store: this file is
+          # readable by the runner's group and baked into the container image.
+          {% for key, value in gen_env.items() %}{{ key }}="{{
+            value
+            | replace(kit_env_backslash, kit_env_backslash_escaped)
+            | replace(kit_env_quote, kit_env_quote_escaped)
+            | replace(kit_env_dollar, kit_env_dollar_escaped)
+            | replace(kit_env_tick, kit_env_tick_escaped) }}"
+          {% endfor %}
+        owner: root
+        group: "{{ kit_runner_group.stdout | trim }}"
+        mode: "0640"
+      when: gen_env | length > 0
+
+    - name: Remove the runner environment file when the profile sets none
+      ansible.builtin.file:
+        path: "{{ kit_env_file }}"
+        state: absent
+      when: gen_env | length == 0
+
+  handlers:
+    - name: Restart redis-server
+      ansible.builtin.systemd_service:
+        name: redis-server
+        state: restarted
+        daemon_reload: true
+
+    - name: Reload the kernel parameters
+      ansible.builtin.command:
+        cmd: sysctl --system
+      changed_when: true

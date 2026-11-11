@@ -1,0 +1,224 @@
+---
+# Installs the GitHub Actions runner binaries only. Registration stays in
+# ./setup.sh register because it needs a short-lived token.
+- name: Install the GitHub Actions runner
+  hosts: all
+  become: true
+  gather_facts: true
+  gather_subset: ["!all"]
+
+  vars:
+    # Empty means "resolve the latest release"; set it to pin a version, e.g.
+    # ./setup.sh runner -e kit_runner_version=2.330.0
+    kit_runner_version: ""
+    kit_runner_dir: /opt/actions-runner
+
+  tasks:
+    - name: Load the rendered profile variables
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/vars/generated.yml"
+
+    # Resolved on the controller, once, for the whole play: the REST API allows
+    # 60 unauthenticated calls per hour per egress IP, and the release redirect
+    # exposes the same tag in its Location header without that budget.
+    - name: Resolve the latest runner version from the release redirect
+      ansible.builtin.uri:
+        url: https://github.com/actions/runner/releases/latest
+        method: HEAD
+        follow_redirects: none
+        status_code: [301, 302, 303, 307, 308]
+      register: kit_runner_redirect
+      changed_when: false
+      delegate_to: localhost
+      become: false
+      run_once: true
+      when: kit_runner_version | length == 0
+
+    - name: Record the runner version
+      ansible.builtin.set_fact:
+        kit_runner_version: >-
+          {{ (kit_runner_redirect.location | default('', true)).split('/') | last
+             | regex_replace('^v', '') }}
+      run_once: true
+      when: kit_runner_version | length == 0
+
+    - name: Fail when the runner version cannot be resolved
+      ansible.builtin.fail:
+        msg: >-
+          Could not resolve the latest actions/runner version from
+          https://github.com/actions/runner/releases/latest. Check that this
+          host can reach github.com, or pass the version yourself:
+          ./setup.sh runner -e kit_runner_version=<x.y.z>
+      when: kit_runner_version | length == 0
+
+    # The release publishes linux-x64 and linux-arm64 archives under two
+    # different names, so the target's package architecture has to be read
+    # rather than assumed.
+    - name: Read the target's package architecture
+      ansible.builtin.command:
+        cmd: dpkg --print-architecture
+      register: kit_pkg_arch
+      changed_when: false
+
+    - name: Map the package architecture to the runner archive name
+      ansible.builtin.set_fact:
+        kit_runner_arch: "{{ {'amd64': 'x64', 'arm64': 'arm64'}.get(kit_pkg_arch.stdout | trim, '') }}"
+
+    - name: Fail when the architecture has no runner archive
+      ansible.builtin.fail:
+        msg: >-
+          The actions/runner release only ships linux-x64 and linux-arm64
+          archives, and this host reports
+          '{{ kit_pkg_arch.stdout | trim }}'. Use an amd64 or arm64 image.
+      when: kit_runner_arch | length == 0
+
+    # Ownership is set once, at the end, by the task that gives the tree to the
+    # runner user; setting it here too would make every run flip it back.
+    - name: Create the runner directory
+      ansible.builtin.file:
+        path: "{{ kit_runner_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Read the installed runner version marker
+      ansible.builtin.slurp:
+        src: "{{ kit_runner_dir }}/.kit-version"
+      register: kit_runner_installed
+      failed_when: false
+
+    # The archive name embeds the version, so a pinned or newly released version
+    # must replace the binaries instead of sitting behind an existing listener.
+    # A missing marker means an install that predates it: that case is handled
+    # by the tasks below, which record what is installed instead of replacing it.
+    - name: Remove the listener and marker of a different version
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ kit_runner_dir }}/bin/Runner.Listener"
+        - "{{ kit_runner_dir }}/.kit-version"
+      when:
+        - kit_runner_installed.content is defined
+        - (kit_runner_installed.content | b64decode | trim) != kit_runner_version
+
+    # An installation from before .kit-version existed is kept, not replaced:
+    # its binaries already work, and reinstalling invalidates the registration
+    # of a runner that may be serving a job right now. The marker records what
+    # is actually installed, so a later run only replaces it if the versions
+    # really differ.
+    - name: Read the version of a pre-marker installation
+      ansible.builtin.command:
+        cmd: "{{ kit_runner_dir }}/bin/Runner.Listener --version"
+      register: kit_runner_legacy_version
+      changed_when: false
+      failed_when: false
+      when: kit_runner_installed.content is not defined
+
+    - name: Record the version of a pre-marker installation
+      ansible.builtin.copy:
+        content: "{{ kit_runner_legacy_version.stdout | trim }}\n"
+        dest: "{{ kit_runner_dir }}/.kit-version"
+        owner: root
+        group: root
+        mode: "0644"
+      when:
+        - kit_runner_installed.content is not defined
+        - (kit_runner_legacy_version.stdout | default('', true) | trim) | length > 0
+
+    # Changing the version of a registered runner needs a follow-up
+    # ./setup.sh register: the registration belongs to the installed binaries,
+    # and the listener refuses to start against a different install id.
+    - name: Report a pre-marker installation
+      ansible.builtin.debug:
+        msg: >-
+          Found a runner without a .kit-version marker and recorded version
+          '{{ kit_runner_legacy_version.stdout | trim }}'; its binaries were
+          left alone. A later run replaces them only if the resolved version
+          differs, and any version change on a registered runner needs a
+          follow-up ./setup.sh register.
+      when:
+        - kit_runner_installed.content is not defined
+        - (kit_runner_legacy_version.stdout | default('', true) | trim) | length > 0
+
+    # This single stat decides the download for every case: missing entirely,
+    # just removed as a version mismatch, or tree present behind a fresh marker.
+    - name: Check for an existing runner
+      ansible.builtin.stat:
+        path: "{{ kit_runner_dir }}/bin/Runner.Listener"
+      register: kit_runner_listener
+
+    # The archive path comes from mktemp and the always: block removes it, so a
+    # failed download cannot leave a fixed /tmp path behind for the next run.
+    - name: Download and unpack the runner
+      block:
+        - name: Create a temporary file for the archive
+          ansible.builtin.tempfile:
+            state: file
+            suffix: .tar.gz
+          register: kit_runner_archive
+
+        - name: Download the runner archive
+          ansible.builtin.get_url:
+            url: >-
+              https://github.com/actions/runner/releases/download/v{{ kit_runner_version
+              }}/actions-runner-linux-{{ kit_runner_arch }}-{{ kit_runner_version }}.tar.gz
+            dest: "{{ kit_runner_archive.path }}"
+            mode: "0644"
+
+        - name: Unpack the runner
+          ansible.builtin.unarchive:
+            src: "{{ kit_runner_archive.path }}"
+            dest: "{{ kit_runner_dir }}"
+            remote_src: true
+
+        - name: Record the installed runner version
+          ansible.builtin.copy:
+            content: "{{ kit_runner_version }}\n"
+            dest: "{{ kit_runner_dir }}/.kit-version"
+            owner: root
+            group: root
+            mode: "0644"
+      when: not kit_runner_listener.stat.exists
+      always:
+        - name: Remove the downloaded archive
+          ansible.builtin.file:
+            path: "{{ kit_runner_archive.path }}"
+            state: absent
+          when: kit_runner_archive.path is defined
+
+    # installdependencies.sh is not idempotent upstream, so its success is
+    # recorded in a marker file next to the binaries.
+    - name: Install the runner dependencies
+      ansible.builtin.shell:
+        cmd: ./bin/installdependencies.sh && touch .dependencies-installed
+        chdir: "{{ kit_runner_dir }}"
+        creates: "{{ kit_runner_dir }}/.dependencies-installed"
+
+    # Runner.Listener --version exits non-zero on some builds, and the version
+    # is what this task is after.
+    - name: Read the runner version
+      ansible.builtin.command:
+        cmd: "{{ kit_runner_dir }}/bin/Runner.Listener --version"
+      register: kit_runner_binary
+      changed_when: false
+      failed_when: false
+
+    - name: Show the runner version
+      ansible.builtin.debug:
+        msg: "actions-runner {{ kit_runner_version }}: {{ kit_runner_binary.stdout }}"
+
+    # Peer auth ties the runner's OS user to its PostgreSQL role, so the
+    # directory has to belong to the account the unit runs as.
+    - name: Read the runner user's primary group
+      ansible.builtin.command:
+        cmd: "id -gn {{ gen_runner_user }}"
+      register: kit_runner_group
+      changed_when: false
+
+    - name: Give the runner directory to the runner user
+      ansible.builtin.file:
+        path: "{{ kit_runner_dir }}"
+        state: directory
+        recurse: true
+        owner: "{{ gen_runner_user }}"
+        group: "{{ kit_runner_group.stdout | trim }}"

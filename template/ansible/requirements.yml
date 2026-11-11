@@ -1,0 +1,12 @@
+---
+# Install once on the controller:
+#   ansible-galaxy collection install -r ansible/requirements.yml
+collections:
+  # community.general.incus is the transport: the containers run no SSH server,
+  # so Ansible reaches them through `incus exec`. The same collection supplies
+  # locale_gen and the npm module used by prepare.yml.
+  - name: community.general
+    version: ">=12.0.0"
+  # community.postgresql is deliberately absent: the peer-auth role is created
+  # with `runuser -u postgres -- psql` because become_user: postgres does not
+  # carry the postgres login environment over the Incus connection.

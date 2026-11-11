@@ -1,0 +1,16 @@
+# Copy this file to requirements/<your-project>.yml and edit the lists below.
+# Unknown keys are a hard error by design: a typo in a copied profile fails the
+# render instead of being silently ignored.
+#
+# Render:  ../scripts/render.py --profile requirements/minimal.yml
+# Only `name` is required; every other key falls back to the documented default.
+name: minimal
+description: Smallest useful runner - a shell, git and jq; no services, no language toolchains.
+
+apt:
+  packages:
+    - ca-certificates
+    - git
+    - curl
+    - jq
+    - build-essential

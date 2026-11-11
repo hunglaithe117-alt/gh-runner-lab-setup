@@ -1,0 +1,41 @@
+# Copy this file to requirements/<your-project>.yml and edit the lists below.
+# Unknown keys are a hard error by design: a typo in a copied profile fails the
+# render instead of being silently ignored.
+#
+# Render:  ../scripts/render.py --profile requirements/python-fastapi.yml
+# Only `name` is required; every other key falls back to the documented default.
+name: python-fastapi
+description: FastAPI service dependencies - PostgreSQL and Redis over unix sockets, plus uv.
+
+apt:
+  packages:
+    - ca-certificates
+    - git
+    - curl
+    - jq
+    - build-essential
+    - libpq-dev
+    - python3-dev
+    - python3-venv
+
+python:
+  uv_tools:
+    - ruff
+    - mypy
+
+services:
+  # postgresql and redis-server are added to the package list by render.py
+  # because these blocks are present; listing them again is unnecessary.
+  postgres:
+    enabled: true
+    # Must match runner_user: peer auth compares the OS user to the role name.
+    role: ubuntu
+  redis:
+    enabled: true
+    unixsocket: /run/redis/redis-server.sock
+    # Quoted: a bare 766 is an integer and 0766 would lose its octal meaning.
+    unixsocketperm: "766"
+
+env:
+  DATABASE_URL: postgresql+asyncpg:///postgres?host=/var/run/postgresql
+  REDIS_URL: unix:///run/redis/redis-server.sock

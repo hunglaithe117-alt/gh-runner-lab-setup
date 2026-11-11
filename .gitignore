@@ -1,0 +1,17 @@
+# Git-ignored local state.
+.slim/deepwork/
+
+# Python and linter caches
+__pycache__/
+*.py[cod]
+.venv/
+.ruff_cache/
+
+# Generated provisioning artifacts
+ansible/inventory.generated.yml
+
+# Secrets
+.env
+!.env.example
+*-auth.json
+runner-token*

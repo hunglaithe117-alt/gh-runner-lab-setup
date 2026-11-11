@@ -1,0 +1,52 @@
+name: self-hosted smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: runner smoke test
+    runs-on: [self-hosted, linux, local]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Runner and host facts
+        run: |
+          echo "runner name:        $RUNNER_NAME"
+          echo "runner environment: $RUNNER_ENVIRONMENT"
+          echo "runner os/arch:     $RUNNER_OS/$RUNNER_ARCH"
+          uname -a
+          python3 --version
+          git --version
+          test "$RUNNER_ENVIRONMENT" = "self-hosted"
+
+      - name: Contract tests
+        run: |
+          if [ ! -f template/tests/test_contract.py ]; then
+            echo "template/tests not present; nothing to run"
+            exit 0
+          fi
+          python=
+          for candidate in python3 /usr/bin/python3; do
+            if "$candidate" -c 'import yaml' >/dev/null 2>&1; then
+              python="$candidate"
+              break
+            fi
+          done
+          if [ -z "$python" ]; then
+            echo "no python3 with PyYAML found; install python3-yaml" >&2
+            exit 1
+          fi
+          echo "using $python ($("$python" --version 2>&1))"
+          cd template
+          "$python" -m unittest discover -s tests -t . -v

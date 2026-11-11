@@ -1,0 +1,72 @@
+#cloud-config
+# Runs once at container creation and is never applied again: cloud-init only
+# consumes user-data on first boot. Everything that must stay correct on a
+# container that already exists lives in ansible/prepare.yml instead.
+package_update: true
+
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+  - jq
+  - locales
+  - tzdata
+  - systemd-timesyncd
+  - postgresql
+  - redis-server
+  - libpq-dev
+  - python3-dev
+  - python3-venv
+  - git
+  - build-essential
+
+timezone: Asia/Ho_Chi_Minh
+locale: en_US.UTF-8
+
+write_files:
+  - path: /etc/sysctl.d/60-gh-runner.conf
+    permissions: "0644"
+    owner: root:root
+    content: |
+      fs.inotify.max_user_instances = 8192
+      vm.max_map_count = 262144
+
+  - path: /usr/local/bin/gh-runner-info
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/bin/bash
+      # Prints this container's name and primary IPv4 address.
+      name="$(hostname)"
+      if command -v ip >/dev/null 2>&1; then
+        addr="$(ip -4 -o addr show dev eth0 | awk '{print $4}' | cut -d/ -f1)"
+      else
+        addr="$(hostname -I | awk '{print $1}')"
+      fi
+      printf 'container: %s\nipv4: %s\n' "$name" "${addr:-unknown}"
+
+runcmd:
+  - sysctl --system
+  - locale-gen en_US.UTF-8 || true
+  - |
+    # Ubuntu's redis-server has no conf.d include, so rewrite the two socket
+    # directives in place. Both seds match the commented and the rewritten
+    # line, which keeps a manual re-run of this snippet harmless.
+    set -eu
+    install -d -o redis -g redis -m 0775 /run/redis
+    sed -i -E \
+      -e 's|^#?[[:space:]]*unixsocket[[:space:]]+.*|unixsocket /run/redis/redis-server.sock|' \
+      -e 's|^#?[[:space:]]*unixsocketperm[[:space:]]+.*|unixsocketperm 766|' \
+      /etc/redis/redis.conf
+    systemctl restart redis-server
+  - |
+    # Peer auth over the unix socket: the login user owns the databases, so no
+    # password is stored anywhere in the image.
+    set -eu
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      pg_isready -q && break
+      sleep 2
+    done
+    su postgres -c "psql -tAc \"SELECT 1 FROM pg_roles WHERE rolname='ubuntu'\"" \
+      | grep -q 1 \
+      || su postgres -c "psql -c 'CREATE ROLE ubuntu SUPERUSER LOGIN'"

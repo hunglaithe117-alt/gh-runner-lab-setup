@@ -1,0 +1,207 @@
+---
+# Idempotent baseline for the runner containers: apt packages, GitHub CLI,
+# uv, ruff, the Redis unix socket and the PostgreSQL role. Safe to re-run.
+- name: Prepare the runner containers
+  hosts: all
+  become: true
+  gather_facts: true
+  # Facts are not needed; skipping them keeps each play to one round trip.
+  gather_subset: ["!all"]
+
+  vars:
+    lab_apt_packages:
+      - ca-certificates
+      - curl
+      - gnupg
+      - jq
+      - locales
+      - tzdata
+      - systemd-timesyncd
+      - postgresql
+      - redis-server
+      - libpq-dev
+      - python3-dev
+      - python3-venv
+      - git
+      - build-essential
+      - ripgrep
+      - fd-find
+      - unzip
+      - tar
+      - xz-utils
+      - zstd
+      # Required by community.general.deb822_repository on the target.
+      - python3-debian
+    lab_gh_keyring: /etc/apt/keyrings/githubcli-archive-keyring.gpg
+    lab_redis_socket: /run/redis/redis-server.sock
+
+  tasks:
+    - name: Install base packages
+      ansible.builtin.apt:
+        name: "{{ lab_apt_packages }}"
+        state: present
+        update_cache: true
+
+    - name: Create the apt keyring directory
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Add the GitHub CLI keyring
+      ansible.builtin.get_url:
+        url: https://cli.github.com/packages/githubcli-archive-keyring.gpg
+        dest: "{{ lab_gh_keyring }}"
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Add the GitHub CLI apt repository
+      ansible.builtin.deb822_repository:
+        name: githubcli
+        types: [deb]
+        uris: https://cli.github.com/packages
+        suites: [stable]
+        components: [main]
+        architectures: [amd64]
+        signed_by: "{{ lab_gh_keyring }}"
+        enabled: true
+
+    - name: Install the GitHub CLI
+      ansible.builtin.apt:
+        name: gh
+        state: present
+        update_cache: true
+
+    - name: Check for fdfind
+      ansible.builtin.stat:
+        path: /usr/bin/fdfind
+      register: lab_fdfind
+
+    - name: Link fdfind to fd
+      ansible.builtin.file:
+        src: /usr/bin/fdfind
+        dest: /usr/local/bin/fd
+        state: link
+        force: true
+      when: lab_fdfind.stat.exists
+
+    - name: Fetch the uv installer
+      ansible.builtin.get_url:
+        url: https://astral.sh/uv/install.sh
+        dest: /usr/local/lib/uv-install.sh
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Install uv into /usr/local/bin
+      ansible.builtin.command:
+        cmd: /usr/local/lib/uv-install.sh
+        creates: /usr/local/bin/uv
+      environment:
+        UV_INSTALL_DIR: /usr/local/bin
+
+    - name: Read the uv version
+      ansible.builtin.command:
+        cmd: /usr/local/bin/uv --version
+      register: lab_uv_version
+      changed_when: false
+
+    - name: Show the uv version
+      ansible.builtin.debug:
+        msg: "{{ lab_uv_version.stdout }}"
+
+    - name: Install ruff as a uv tool for ubuntu
+      ansible.builtin.command:
+        cmd: /usr/local/bin/uv tool install ruff
+        creates: /home/ubuntu/.local/bin/ruff
+      become: true
+      become_user: ubuntu
+      environment:
+        HOME: /home/ubuntu
+
+    - name: Check for the ubuntu ruff binary
+      ansible.builtin.stat:
+        path: /home/ubuntu/.local/bin/ruff
+      register: lab_ruff
+
+    - name: Link ruff into /usr/local/bin
+      ansible.builtin.file:
+        src: /home/ubuntu/.local/bin/ruff
+        dest: /usr/local/bin/ruff
+        state: link
+        force: true
+      when: lab_ruff.stat.exists
+
+    - name: Read the ruff version
+      ansible.builtin.command:
+        cmd: /usr/local/bin/ruff --version
+      register: lab_ruff_version
+      changed_when: false
+
+    - name: Show the ruff version
+      ansible.builtin.debug:
+        msg: "{{ lab_ruff_version.stdout }}"
+
+    - name: Create the Redis runtime directory
+      ansible.builtin.file:
+        path: /run/redis
+        state: directory
+        owner: redis
+        group: redis
+        mode: "0775"
+
+    - name: Set the Redis unix socket path
+      ansible.builtin.lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: '^#?\s*unixsocket\s+'
+        line: "unixsocket {{ lab_redis_socket }}"
+      notify: Restart redis-server
+
+    - name: Set the Redis unix socket permissions
+      ansible.builtin.lineinfile:
+        path: /etc/redis/redis.conf
+        regexp: '^#?\s*unixsocketperm\s+'
+        line: "unixsocketperm 766"
+      notify: Restart redis-server
+
+    - name: Ensure PostgreSQL is running
+      ansible.builtin.systemd_service:
+        name: postgresql
+        state: started
+
+    # community.postgresql.postgresql_user with become_user: postgres fails
+    # over the Incus connection: the module needs the postgres user's
+    # environment, which that connection type does not reproduce. runuser
+    # gives the same result; the alternative is ansible_ssh_pipelining: true
+    # with the SSH transport, where become_user works as documented.
+    - name: Check for the ubuntu PostgreSQL role
+      ansible.builtin.command:
+        cmd: >-
+          runuser -u postgres -- psql -tAc
+          "SELECT 1 FROM pg_roles WHERE rolname='ubuntu'"
+      register: lab_pg_role
+      changed_when: false
+
+    # Mirrors the cloud-init runcmd line verbatim, so both provisioning paths
+    # read the same to someone learning them.
+    - name: Create the ubuntu PostgreSQL superuser role
+      ansible.builtin.shell: # noqa: command-instead-of-shell
+        cmd: runuser -u postgres -- psql -c 'CREATE ROLE ubuntu SUPERUSER LOGIN'
+      changed_when: true
+      when: lab_pg_role.stdout | trim != '1'
+
+  handlers:
+    - name: Restart redis-server
+      ansible.builtin.systemd_service:
+        name: redis-server
+        state: restarted
+        daemon_reload: true
+
+    - name: Restart postgresql
+      ansible.builtin.systemd_service:
+        name: postgresql
+        state: restarted
+        daemon_reload: true
